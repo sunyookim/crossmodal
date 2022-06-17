@@ -1,0 +1,6 @@
+matplotlib==3.1.2
+numpy==1.18.1
+scikit-learn==0.20.0
+gensim==3.8.0
+tqdm
+transformers
