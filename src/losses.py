@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-def cos_loss(out1, out2, ys=None, margin=None):
+def cos_loss(out1, out2, ys=None, feat1=None, feat=None, feat_penalties=None, sharing=False, margin=None):
     return 1 - F.cosine_similarity(out1, out2).mean()
 
 

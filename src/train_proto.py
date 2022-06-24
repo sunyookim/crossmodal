@@ -4,27 +4,19 @@ import numpy as np
 import os
 import pickle
 import random
-from sklearn import model_selection
 import torch
 import torch.nn.functional as F
 
-from decimal import Decimal
-from PIL import Image
-from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, roc_curve, auc, confusion_matrix
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 from torch import nn
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
-from data_utils import MetaFolderTwo, split_meta_both, r_at_k, mk_retrieve, np_transform, collate_recipe, collate_recipe_verbose, mk_dataloader_1, mk_dataloader_2, XmodalDataset
+from data_utils import XmodalDataset, t2i_Dataset
 from models import *
 from losses import *
 from tools import *
 from datetime import datetime
-import sys
-import pprint
 
 
 
@@ -121,7 +113,7 @@ def train_align(args, net, loss_fn, data_iter, device, feat_penalties, margin=0.
 
     return np.mean(align_losses)
 
-def eval_proto(args, net, loss_fn, data_iter, device, best_acc, best_model_path):
+def eval_proto(args, net, loss_fn, data_iter, device, best_acc=0.0, best_model_path=None):
     eval_loss = []
     eval_acc = []
     net.eval()
@@ -141,7 +133,7 @@ def eval_proto(args, net, loss_fn, data_iter, device, best_acc, best_model_path)
         eval_loss.append(loss.item())
         eval_acc.append(acc.item())
     eval_loss, eval_acc = np.mean(eval_loss), np.mean(eval_acc)
-    if eval_acc >= best_acc:
+    if eval_acc >= best_acc and best_model_path:
         torch.save(model.state_dict(), best_model_path % best_acc)
         best_acc = eval_acc
     postfix = ' (Best)' if eval_acc >= best_acc else ' (Best: {:.3f})'.format(best_acc)
@@ -181,7 +173,7 @@ def train_croma(net, loss_fn, optimizer, data_iter, iterations, device):
     que_acc = float(query_correct)/query_samples
     return np.mean(support_losses), sup_acc, np.mean(query_losses), que_acc
 
-def eval_croma(net, loss_fn, data_iter, iterations, device, best_acc, best_model_path):
+def eval_croma(net, loss_fn, data_iter, iterations, device, best_acc=0.0, best_model_path=None):
     support_losses = []
     query_losses = []
     support_correct = 0
@@ -212,7 +204,7 @@ def eval_croma(net, loss_fn, data_iter, iterations, device, best_acc, best_model
     sup_acc = float(support_correct)/support_samples
     eval_loss = np.mean(query_losses)
     eval_acc = float(query_correct)/query_samples
-    if eval_acc >= best_acc:
+    if eval_acc >= best_acc and best_model_path:
         torch.save(model.state_dict(), best_model_path % best_acc)
         best_acc = eval_acc
     postfix = ' (Best)' if eval_acc >= best_acc else ' (Best: {:.3f})'.format(best_acc)
@@ -220,7 +212,7 @@ def eval_croma(net, loss_fn, data_iter, iterations, device, best_acc, best_model
         'Val Query Acc: {:.3f}{}'.format(sup_loss, sup_acc, eval_loss, eval_acc, postfix),flush=True)
     return best_acc, eval_loss, eval_acc
 
-def eval_croma_same(net, loss_fn, data_iter, iterations, device, best_acc, best_model_path):
+def eval_croma_same(net, loss_fn, data_iter, iterations, device, best_acc=0.0, best_model_path=None):
     support_losses = []
     query_losses = []
     support_correct = 0
@@ -251,7 +243,7 @@ def eval_croma_same(net, loss_fn, data_iter, iterations, device, best_acc, best_
     sup_acc = float(support_correct)/support_samples
     eval_loss = np.mean(query_losses)
     eval_acc = float(query_correct)/query_samples
-    if eval_acc >= best_acc:
+    if eval_acc >= best_acc and args.train_mode=='train':
         torch.save(model.state_dict(), best_model_path % best_acc)
         best_acc = eval_acc
     postfix = ' (Best)' if eval_acc >= best_acc else ' (Best: {:.3f})'.format(best_acc)
@@ -266,7 +258,7 @@ def plot(align_l, proto_l, proto_a, eval_l, eval_a, args):
     plt.title("Training and Validation Loss")
 
     plt.subplot(1, 2, 1)
-    # plt.plot(align_l,label="train_align_loss")
+    plt.plot(align_l,label="train_align_loss")
     plt.plot(proto_l,label="train_proto_loss")
     plt.plot(eval_l,label="eval_loss")
     plt.xlabel("iterations")
@@ -281,6 +273,7 @@ def plot(align_l, proto_l, proto_a, eval_l, eval_a, args):
     plt.legend()
     
     plt.savefig(file_path, dpi=300)
+    
 ## main
 
 if __name__ == "__main__":
@@ -325,7 +318,9 @@ if __name__ == "__main__":
     parser.add_argument('--share-penalties', '-sp', nargs='+', default=[0.1, 0.1])
     # parser.add_argument('--fig-filename', type=str, required=True)
     parser.add_argument('--croma', action='store_true', help='use croma training', default=False)
-
+    parser.add_argument('--train_mode', default='train', type=str, help='train/test')
+    parser.add_argument('--load_checkpoint', default=None, type=str, help='path to checkpoint')
+    
     args = parser.parse_args()
 
 
@@ -352,6 +347,11 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
 
+    if args.l == 'tri':
+        loss_fn = tri_loss
+    elif args.l == 'cos':
+        loss_fn = cos_loss
+
     if args.croma:
         enc_i = ImageEncoder(args.fc_dim)
         enc_t = TextEncoder(args.fc_dim)
@@ -365,91 +365,189 @@ if __name__ == "__main__":
         model = ProtoModel(audio_enc=ImageEncoder(args.fc_dim,mode=args.aud_m),text_enc=TextEncoder(args.fc_dim),image_enc=ImageEncoder(args.fc_dim,mode=args.vis_m), fc_dim=args.fc_dim, num_classes=args.classes, device=device, mode=args.mode)
         model.to(device)
 
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    model_save_root = os.path.join(cur_dir, 'checkpoints', timestamp)
-    if not os.path.exists(model_save_root):
-        os.makedirs(model_save_root)
-    best_model_path = os.path.join(model_save_root, "best_model_%.3f.pt")
-    last_model_path = os.path.join(model_save_root, "last_model.pt")
-    best_acc = 0.0
+    if args.load_checkpoint:
+        model.load_state_dict(torch.load(args.load_checkpoint))
 
     #train
+    if args.train_mode == 'train':
 
-    align_losses = []; train_losses = []; train_accs = []
-    eval_losses = []; eval_accs = []
-    for iteration in range(args.meta_iterations):
-        if args.mode in ["a2i", "i2a", "a2a"]:
-            vision_dataset = XmodalDataset(task_mode = 'visual', train_mode='train', 
-                                        BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
-            audio_dataset  = XmodalDataset(task_mode='audio', train_mode='train', 
-                                        BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
-            align_dataset  = XmodalDataset(task_mode='align', train_mode='train', 
-                                        BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
+        cur_dir = os.path.dirname(os.path.abspath(__file__))
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        model_save_root = os.path.join(cur_dir, 'checkpoints', timestamp)
+        if not os.path.exists(model_save_root):
+            os.makedirs(model_save_root)
+        best_model_path = os.path.join(model_save_root, "best_model_%.3f.pt")
+        last_model_path = os.path.join(model_save_root, "last_model.pt")
+        best_acc = 0.0
 
-            vision_dataloader = DataLoader(vision_dataset, batch_size=args.batch, shuffle=True)
-            audio_dataloader  = DataLoader(audio_dataset, batch_size=args.batch, shuffle=True)
-            align_dataloader  = DataLoader(align_dataset, batch_size=args.train_align_batch, shuffle=True)
+        align_losses = []; train_losses = []; train_accs = []
+        eval_losses = []; eval_accs = []
 
-            vision_iter = iter(vision_dataloader)
-            audio_iter  = iter(audio_dataloader)
-            align_iter  = iter(align_dataloader)
-            
-            if args.mode.startswith("a"):
-                val_audio_iter  = iter(
-                    DataLoader(
-                        XmodalDataset(task_mode='audio', train_mode='val', BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
-                        batch_size=args.batch,
-                        shuffle=True
+        for iteration in range(args.meta_iterations):
+            if args.mode in ["a2i", "i2a", "a2a"]:
+                vision_dataset = XmodalDataset(task_mode = 'visual', train_mode='train', 
+                                            BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
+                audio_dataset  = XmodalDataset(task_mode='audio', train_mode='train', 
+                                            BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
+                align_dataset  = XmodalDataset(task_mode='align', train_mode='train', 
+                                            BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
+
+                vision_dataloader = DataLoader(vision_dataset, batch_size=args.batch, shuffle=True)
+                audio_dataloader  = DataLoader(audio_dataset, batch_size=args.batch, shuffle=True)
+                align_dataloader  = DataLoader(align_dataset, batch_size=args.train_align_batch, shuffle=True)
+
+                vision_iter = iter(vision_dataloader)
+                audio_iter  = iter(audio_dataloader)
+                align_iter  = iter(align_dataloader)
+                
+                if args.mode.startswith("a"):
+                    val_audio_iter  = iter(
+                        DataLoader(
+                            XmodalDataset(task_mode='audio', train_mode='val', BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
+                            batch_size=args.batch,
+                            shuffle=True
+                        )
                     )
-                )
-                # test_audio_iter = iter(
-                #     DataLoader(
-                #         XmodalDataset(task_mode='audio', train_mode='test',  BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
-                #         batch_size=args.batch,
-                #         shuffle=True
-                #     )
-                # )
+
+                else:
+                    val_vision_iter  = iter(
+                        DataLoader(
+                            XmodalDataset(task_mode='visual', train_mode='val',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
+                            batch_size=args.batch,
+                            shuffle=True
+                        )
+                    )
+
+            elif args.mode in ["i2t", "t2i"]:
+                vision_dataset = t2i_Dataset(task_mode = 'visual', train_mode='train',  
+                                            BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
+                text_dataset  = t2i_Dataset(task_mode='text', train_mode='train',  
+                                            BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
+                align_dataset  = t2i_Dataset(task_mode='align', train_mode='train',  
+                                            BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
+                
+                vision_dataloader = DataLoader(vision_dataset, batch_size=args.batch, shuffle=True)
+                text_dataloader  = DataLoader(text_dataset, batch_size=args.batch, shuffle=True)
+                align_dataloader  = DataLoader(align_dataset, batch_size=args.train_align_batch, shuffle=True)
+
+                vision_iter = iter(vision_dataloader)
+                text_iter  = iter(text_dataloader)
+                align_iter  = iter(align_dataloader)
+
+                if args.mode.startswith("i"):
+                    val_vision_iter  = iter(
+                        DataLoader(
+                            t2i_Dataset(task_mode='visual', train_mode='val',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
+                            batch_size=args.batch,
+                            shuffle=True
+                        )
+                    )
+
+                else:
+                    val_text_iter  = iter(
+                        DataLoader(
+                            t2i_Dataset(task_mode='text', train_mode='val',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
+                            batch_size=args.batch,
+                            shuffle=True
+                        )
+                    )
+            
+            #train alignment
+            #set soft params sharing layers
+            if args.mode[0] != args.mode[-1]:
+                if '3' in args.sharing_layer:
+                    model.image_enc.model.layer3.register_forward_hook(get_activation('img_l3'))
+                    model.audio_enc.model.layer3.register_forward_hook(get_activation('aud_l3'))
+                if '4' in args.sharing_layer:
+                    model.image_enc.model.layer4.register_forward_hook(get_activation('img_l4'))
+                    model.audio_enc.model.layer4.register_forward_hook(get_activation('aud_l4'))
+                feat_penalties = [float(p) for p in args.share_penalties]
+                
+                align_loss = train_align(args, model, tri_loss, align_iter, device, feat_penalties, margin=0.1)
+                align_losses.append(align_loss)
+                print("Align loss: ", align_loss)
+
+            if args.croma:
+                net = model.clone()
+                cross_entropy = nn.CrossEntropyLoss()
+                optimizer = torch.optim.Adam(net.parameters(), lr=args.lr_proto, betas=(0, 0.999))
+                if args.mode.endswith("i"):
+                    sloss, sacc, qloss, qacc = train_croma(net, cross_entropy, optimizer, vision_iter, args.iterations, device)
+                elif args.mode.endswith("a"):
+                    sloss, sacc, qloss, qacc = train_croma(net, cross_entropy, optimizer, audio_iter, args.iterations, device)
+                elif args.mode.endswith("t"):
+                    sloss, sacc, qloss, qacc = train_croma(net, cross_entropy, optimizer, text_iter, args.iterations, device)
+                print('Support Loss: {:.3f}, Support Acc: {:.3f}, Query Loss: {:.3f}, Query Acc: {:.3f}'.format(sloss, sacc, qloss, qacc), flush=True)
+                train_losses.append(qloss); train_accs.append(qacc)
+                model.point_grad_to(net)
+                meta_optimizer.step()
+                
+                if iteration % args.val_epoch == 0:
+                    net = model.clone()
+                    if args.mode[0] != args.mode[-1]:
+                        if args.mode.startswith("i"):
+                            best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, val_vision_iter, args.iterations, device, best_acc, best_model_path)
+                            # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_vision_iter, args.test_iterations, device, best_acc, best_model_path)
+                        elif args.mode.startswith("a"):
+                            best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, val_audio_iter, args.iterations, device, best_acc, best_model_path)
+                            # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_audio_iter, args.test_iterations, device, best_acc, best_model_path)
+                        elif args.mode.startswith("t"):
+                            best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, val_text_iter, args.iterations, device, best_acc, best_model_path)
+                            # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_text_iter, args.test_iterations, device, best_acc, best_model_path)
+                    else:
+                        if args.mode.startswith("i"):
+                            best_acc, eval_loss, eval_acc = eval_croma_same(net, cross_entropy, val_vision_iter, args.iterations, device, best_acc, best_model_path)
+                            # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_vision_iter, args.test_iterations, device, best_acc, best_model_path)
+                        elif args.mode.startswith("a"):
+                            best_acc, eval_loss, eval_acc = eval_croma_same(net, cross_entropy, val_audio_iter, args.iterations, device, best_acc, best_model_path)
+                            # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_audio_iter, args.test_iterations, device, best_acc, best_model_path)
+                        elif args.mode.startswith("t"):
+                            best_acc, eval_loss, eval_acc = eval_croma_same(net, cross_entropy, val_text_iter, args.iterations, device, best_acc, best_model_path)
+                            # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_text_iter, args.test_iterations, device, best_acc, best_model_path)
+                    eval_losses.append(eval_loss)
+                    eval_accs.append(eval_acc)
+
             else:
-                val_vision_iter  = iter(
+                if args.mode.endswith("i"):
+                    loss, acc = train_proto(args, model, prototypical_loss, vision_iter, device)
+                elif args.mode.endswith("a"):
+                    loss, acc = train_proto(args, model, prototypical_loss, audio_iter, device)
+                elif args.mode.endswith("t"):
+                    loss, acc = train_proto(args, model, prototypical_loss, text_iter, device)
+                print('Train Loss: {:.3f}, Train Acc: {:.3f}'.format(loss, acc), flush=True)
+                train_losses.append(loss); train_accs.append(acc)
+
+                if iteration % args.val_epoch == 0:
+                    if args.mode.startswith("i"):
+                        best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, val_vision_iter, device, best_acc, best_model_path)
+                        # best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, test_vision_iter, device, best_acc, best_model_path)
+                    elif args.mode.startswith("a"):
+                        best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, val_audio_iter, device, best_acc, best_model_path)
+                        # best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, test_audio_iter, device, best_acc, best_model_path)
+                    elif args.mode.startswith("t"):
+                        best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, val_text_iter, device, best_acc, best_model_path)
+                        # best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, test_text_iter, device, best_acc, best_model_path)
+                    eval_losses.append(eval_loss)
+                    eval_accs.append(eval_acc)
+
+        torch.save(model.state_dict(), last_model_path)
+        plot(align_losses, train_losses, train_accs, eval_losses, eval_accs, args)
+    
+    #test
+    model.eval()
+
+    eval_accs = []
+    for iteration in range(args.eval_tasks):
+        if args.mode in ["a2i", "i2a", "a2a"]:
+            if args.mode.startswith("a"):
+                test_audio_iter = iter(
                     DataLoader(
-                        XmodalDataset(task_mode='visual', train_mode='val',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
+                        XmodalDataset(task_mode='audio', train_mode='test',  BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
                         batch_size=args.batch,
                         shuffle=True
                     )
                 )
-                # test_vision_iter  = iter(
-                #     DataLoader(
-                #         XmodalDataset(task_mode='visual', train_mode='test',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
-                #         batch_size=args.batch,
-                #         shuffle=True
-                #     )
-                # )
-
-        elif args.mode in ["i2t", "t2i"]:
-            vision_dataset = XmodalDataset(task_mode = 'visual', train_mode='train',  
-                                        BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
-            text_dataset  = XmodalDataset(task_mode='text', train_mode='train',  
-                                        BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
-            align_dataset  = XmodalDataset(task_mode='align', train_mode='train',  
-                                        BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224)
-            
-            vision_dataloader = DataLoader(vision_dataset, batch_size=args.batch, shuffle=True)
-            text_dataloader  = DataLoader(text_dataset, batch_size=args.batch, shuffle=True)
-            align_dataloader  = DataLoader(align_dataset, batch_size=args.train_align_batch, shuffle=True)
-
-            vision_iter = iter(vision_dataloader)
-            text_iter  = iter(text_dataloader)
-            align_iter  = iter(align_dataloader)
-
-            if args.mode.startswith("i"):
-                val_vision_iter  = iter(
-                    DataLoader(
-                        XmodalDataset(task_mode='visual', train_mode='val',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
-                        batch_size=args.batch,
-                        shuffle=True
-                    )
-                )
+            else:
                 test_vision_iter  = iter(
                     DataLoader(
                         XmodalDataset(task_mode='visual', train_mode='test',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
@@ -457,101 +555,53 @@ if __name__ == "__main__":
                         shuffle=True
                     )
                 )
-            else:
-                val_text_iter  = iter(
+
+        elif args.mode in ["i2t", "t2i"]:
+            if args.mode.startswith("i"):
+                test_vision_iter  = iter(
                     DataLoader(
-                        XmodalDataset(task_mode='text', train_mode='val',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
+                        t2i_Dataset(task_mode='visual', train_mode='test',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
                         batch_size=args.batch,
                         shuffle=True
                     )
                 )
+            else:
                 test_text_iter  = iter(
                     DataLoader(
-                        XmodalDataset(task_mode='text', train_mode='test',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
+                        t2i_Dataset(task_mode='text', train_mode='test',   BS = args.iterations, n_way = args.classes, k_shot = args.train_shots, k_query = args.test_shots, resize = 224),
                         batch_size=args.batch,
                         shuffle=True
                     )
                 )
         
-        #train alignment
-        #set soft params sharing layers
-        if args.mode[0] != args.mode[-1]:
-            if '3' in args.sharing_layer:
-                model.image_enc.model.layer3.register_forward_hook(get_activation('img_l3'))
-                model.audio_enc.model.layer3.register_forward_hook(get_activation('aud_l3'))
-            if '4' in args.sharing_layer:
-                model.image_enc.model.layer4.register_forward_hook(get_activation('img_l4'))
-                model.audio_enc.model.layer4.register_forward_hook(get_activation('aud_l4'))
-            feat_penalties = [float(p) for p in args.share_penalties]
-            
-            align_loss = train_align(args, model, tri_loss, align_iter, device, feat_penalties, margin=0.1)
-            align_losses.append(align_loss)
-
         if args.croma:
             net = model.clone()
-            cross_entropy = nn.CrossEntropyLoss()
-            optimizer = torch.optim.Adam(net.parameters(), lr=args.lr_proto, betas=(0, 0.999))
-            if args.mode.endswith("i"):
-                sloss, sacc, qloss, qacc = train_croma(net, cross_entropy, optimizer, vision_iter, args.iterations, device)
-            elif args.mode.endswith("a"):
-                sloss, sacc, qloss, qacc = train_croma(net, cross_entropy, optimizer, audio_iter, args.iterations, device)
-            elif args.mode.endswith("t"):
-                sloss, sacc, qloss, qacc = train_croma(net, cross_entropy, optimizer, text_iter, args.iterations, device)
-            print('Support Loss: {:.3f}, Support Acc: {:.3f}, Query Loss: {:.3f}, Query Acc: {:.3f}'.format(sloss, sacc, qloss, qacc), flush=True)
-            train_losses.append(qloss); train_accs.append(qacc)
-            model.point_grad_to(net)
-            meta_optimizer.step()
-            
-            if iteration % args.val_epoch == 0:
-                net = model.clone()
-                if args.mode[0] != args.mode[-1]:
-                    if args.mode.startswith("i"):
-                        best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, val_vision_iter, args.iterations, device, best_acc, best_model_path)
-                        # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_vision_iter, args.test_iterations, device, best_acc, best_model_path)
-                    elif args.mode.startswith("a"):
-                        best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, val_audio_iter, args.iterations, device, best_acc, best_model_path)
-                        # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_audio_iter, args.test_iterations, device, best_acc, best_model_path)
-                    elif args.mode.startswith("t"):
-                        best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, val_text_iter, args.iterations, device, best_acc, best_model_path)
-                        # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_text_iter, args.test_iterations, device, best_acc, best_model_path)
-                else:
-                    if args.mode.startswith("i"):
-                        best_acc, eval_loss, eval_acc = eval_croma_same(net, cross_entropy, val_vision_iter, args.iterations, device, best_acc, best_model_path)
-                        # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_vision_iter, args.test_iterations, device, best_acc, best_model_path)
-                    elif args.mode.startswith("a"):
-                        best_acc, eval_loss, eval_acc = eval_croma_same(net, cross_entropy, val_audio_iter, args.iterations, device, best_acc, best_model_path)
-                        # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_audio_iter, args.test_iterations, device, best_acc, best_model_path)
-                    elif args.mode.startswith("t"):
-                        best_acc, eval_loss, eval_acc = eval_croma_same(net, cross_entropy, val_text_iter, args.iterations, device, best_acc, best_model_path)
-                        # best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_text_iter, args.test_iterations, device, best_acc, best_model_path)
-                eval_losses.append(eval_loss)
-                eval_accs.append(eval_acc)
+            if args.mode[0] != args.mode[-1]:
+                if args.mode.startswith("i"):
+                    best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_vision_iter, args.test_iterations, device)
+                elif args.mode.startswith("a"):
+                    best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_audio_iter, args.test_iterations, device)
+                elif args.mode.startswith("t"):
+                    best_acc, eval_loss, eval_acc = eval_croma(net, cross_entropy, test_text_iter, args.test_iterations, device)
+            else:
+                if args.mode.startswith("i"):
+                    best_acc, eval_loss, eval_acc = eval_croma_same(net, cross_entropy, test_vision_iter, args.test_iterations, device)
+                elif args.mode.startswith("a"):
+                    best_acc, eval_loss, eval_acc = eval_croma_same(net, cross_entropy, test_audio_iter, args.test_iterations, device)
+                elif args.mode.startswith("t"):
+                    best_acc, eval_loss, eval_acc = eval_croma_same(net, cross_entropy, test_text_iter, args.test_iterations, device)
+            eval_accs.append(eval_acc)
 
         else:
-            if args.mode.endswith("i"):
-                loss, acc = train_proto(args, model, prototypical_loss, vision_iter, device)
-            elif args.mode.endswith("a"):
-                loss, acc = train_proto(args, model, prototypical_loss, audio_iter, device)
-            elif args.mode.endswith("t"):
-                loss, acc = train_proto(args, model, prototypical_loss, text_iter, device)
-            print('Train Loss: {:.3f}, Train Acc: {:.3f}'.format(loss, acc), flush=True)
-            train_losses.append(loss); train_accs.append(acc)
+            if args.mode.startswith("i"):
+                best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, test_vision_iter, device)
+            elif args.mode.startswith("a"):
+                best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, test_audio_iter, device)
+            elif args.mode.startswith("t"):
+                best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, test_text_iter, device)
+            eval_accs.append(eval_acc)
 
-            if iteration % args.val_epoch == 0:
-                if args.mode.startswith("i"):
-                    best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, val_vision_iter, device, best_acc, best_model_path)
-                    # best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, test_vision_iter, device, best_acc, best_model_path)
-                elif args.mode.startswith("a"):
-                    best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, val_audio_iter, device, best_acc, best_model_path)
-                    # best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, test_audio_iter, device, best_acc, best_model_path)
-                elif args.mode.startswith("t"):
-                    best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, val_text_iter, device, best_acc, best_model_path)
-                    # best_acc, eval_loss, eval_acc = eval_proto(args, model, prototypical_loss, test_text_iter, device, best_acc, best_model_path)
-                eval_losses.append(eval_loss)
-                eval_accs.append(eval_acc)
-
-    torch.save(model.state_dict(), last_model_path)
-    plot(align_losses, train_losses, train_accs, eval_losses, eval_accs, args)
+    print('Mean accuracy over test tasks: {:.3f}'.format(np.mean(eval_accs), flush=True))
     
 
     
